@@ -1,0 +1,8 @@
+[manager]
+address = "127.0.0.1:50051"
+retry_interval_s = 5
+
+[service]
+name = "example-service"
+description = "Example h2pcontrol service"
+address = "100.80.36.72:50055"
