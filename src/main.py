@@ -3,7 +3,7 @@ import logging
 
 from h2pcontrol.sdk.server import ServerConfig
 
-from service import ExampleService
+from service import PicoscopeService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 async def main():
     cfg = ServerConfig.load()
-    svc = ExampleService(cfg)
+    svc = PicoscopeService(cfg)
     await svc.start()
 
 

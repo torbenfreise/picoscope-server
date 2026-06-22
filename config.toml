@@ -3,6 +3,6 @@ address = "127.0.0.1:50051"
 retry_interval_s = 5
 
 [service]
-name = "example-service"
-description = "Example h2pcontrol service"
-address = "100.80.36.72:50055"
+name = "picoscope-service"
+description = "PicoScope oscilloscope acquisition and configuration service"
+address = "100.114.164.102:50055"

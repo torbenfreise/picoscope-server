@@ -1,1 +1,1 @@
-from .example import ExampleService as ExampleService
+from .picoscope import PicoscopeService as PicoscopeService

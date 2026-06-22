@@ -1,5 +1,5 @@
 [project]
-name = "h2pcontrol-server-template"
+name = "h2pcontrol-picoscope-service"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,6 +10,7 @@ dependencies = [
     "beyer-labs-h2pcontrol-community-nipunn1313-mypy>=5.1.0.dev0,<6",
     "beyer-labs-h2pcontrol-community-nipunn1313-mypy-grpc>=5.1.0.dev0,<6",
     "h2pcontrol-sdk",
+    "pypicosdk>=1.7.4",
 ]
 
 [dependency-groups]
