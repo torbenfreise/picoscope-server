@@ -2,6 +2,8 @@ import logging
 from collections.abc import AsyncIterator
 
 from h2pcontrol.picoscope.v1.picoscope_pb2 import (
+    ArmCaptureRequest,
+    ArmCaptureResponse,
     ConfigureChannelRequest,
     ConfigureChannelResponse,
     ConfigureResolutionRequest,
@@ -12,10 +14,8 @@ from h2pcontrol.picoscope.v1.picoscope_pb2 import (
     ConfigureTriggerResponse,
     GetTimebasesRequest,
     GetTimebasesResponse,
-    GetTraceRequest,
-    GetTraceResponse,
-    StreamTracesRequest,
-    StreamTracesResponse,
+    StreamCapturesRequest,
+    StreamCapturesResponse,
 )
 from h2pcontrol.picoscope.v1.picoscope_pb2_grpc import PicoscopeServiceServicer
 from h2pcontrol.sdk.server import Server
@@ -47,12 +47,12 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
     ) -> ConfigureResolutionResponse:
         raise NotImplementedError
 
-    async def GetTrace(self, request: GetTraceRequest, context) -> GetTraceResponse:
+    async def ArmCapture(self, request: ArmCaptureRequest, context) -> ArmCaptureResponse:
         raise NotImplementedError
 
-    async def StreamTraces(  # type: ignore[override]
-        self, request: StreamTracesRequest, context
-    ) -> AsyncIterator[StreamTracesResponse]:
+    async def StreamCaptures(  # type: ignore[override]
+        self, request: StreamCapturesRequest, context
+    ) -> AsyncIterator[StreamCapturesResponse]:
         raise NotImplementedError
 
     async def GetTimebases(self, request: GetTimebasesRequest, context) -> GetTimebasesResponse:
