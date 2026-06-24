@@ -266,16 +266,7 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
                 await self._capture_armed.wait()
                 self._capture_armed.clear()
 
-                logger.info(
-                    "get_values: total_samples=%d, handle=%s, buffers=%s, channel_db=%s",
-                    total_samples,
-                    self._scope.handle,
-                    {k: (type(v).__name__, len(v) if hasattr(v, '__len__') else v) for k, v in self._capture_buffers.items()},
-                    list(self._scope.channel_db),
-                )
-                await asyncio.to_thread(self._scope.is_ready)
-                logger.info("is_ready completed, calling get_values")
-                await asyncio.to_thread(self._scope.get_values, total_samples, 0, 0, 1)
+                await asyncio.to_thread(self._scope.get_values, total_samples)
 
                 volts = self._scope.adc_to_volts(self._capture_buffers)
                 overflowed = self._scope.is_over_range()
