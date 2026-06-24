@@ -266,7 +266,7 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
                 await self._capture_armed.wait()
                 self._capture_armed.clear()
 
-                await asyncio.to_thread(self._scope.get_values, total_samples)
+                await asyncio.to_thread(self._scope.get_values, total_samples, 0, 0, 1)
 
                 volts = self._scope.adc_to_volts(self._capture_buffers)
                 overflowed = self._scope.is_over_range()
@@ -287,7 +287,10 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
 
                 yield StreamCapturesResponse(traces=traces, trigger_timestamp=ts)
         finally:
-            self._scope.stop()
+            try:
+                self._scope.stop()
+            except Exception:
+                pass
 
     # -- Query --
 
