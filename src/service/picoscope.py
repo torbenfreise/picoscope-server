@@ -284,7 +284,7 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
                 for ch_name, samples in volts.items():
                     traces.append(
                         ChannelTrace(
-                            channel_index=CHANNEL[ch_name].value,
+                            channel_index=ch_name.value,
                             samples=samples.tolist(),
                             times_seconds=times,
                             overflow=ch_name in overflowed,
