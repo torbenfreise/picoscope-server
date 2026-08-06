@@ -111,6 +111,10 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         # Number of waveforms armed for the current/last capture. 1 means a
         # normal single block capture; >1 means rapid block mode.
         self._num_captures: int = 1
+        # Current device resolution. open_unit() above takes the ps5000a
+        # default of 8 bit. Tracked here rather than read back from
+        # self._scope.resolution, which stores the mapped int, not the literal.
+        self._resolution: resolution_literal = "8bit"
 
     def _healthy(self) -> bool:
         try:
@@ -190,8 +194,29 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
                 grpc.StatusCode.INVALID_ARGUMENT, f"Unsupported resolution: {request.resolution}"
             )
 
+        # Changing resolution requires closing and reopening the unit, which
+        # invalidates the device handle and turns every channel off. Skip it
+        # when nothing would change, so that re-running an experiment against
+        # a long-lived server does not needlessly cycle the device.
+        if resolution == self._resolution:
+            logger.info("Resolution already %s, leaving device open", resolution)
+            return ConfigureResolutionResponse()
+
+        # Stop first: closing a unit mid-capture can fail, and close_unit()
+        # discards the driver status, so the failure would pass unnoticed and
+        # leave the handle stale.
+        self._scope.stop()
         self._scope.close_unit()
         self._scope.open_unit(resolution=resolution)
+        self._resolution = resolution
+
+        # open_unit() turns all channels off and resets segmented memory, so
+        # any buffers and capture config from before the reopen are void.
+        # Channels and timebase must be reconfigured after this call.
+        self._capture_buffers = {}
+        self._num_captures = 1
+        self._capture_armed.clear()
+
         logger.info("Resolution set to %s (device reopened)", resolution)
         return ConfigureResolutionResponse()
 
@@ -259,6 +284,11 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
                 total_samples, captures=num_captures
             )
         else:
+            # Segment count persists on the device, so a normal capture armed
+            # after a rapid block run would otherwise only see 1/n of the
+            # memory in segment 0 and silently truncate.
+            self._scope.memory_segments(1)
+            self._scope.set_no_of_captures(1)
             self._capture_buffers = self._scope.set_data_buffer_for_enabled_channels(total_samples)
 
         self._num_captures = num_captures
