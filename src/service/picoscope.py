@@ -106,6 +106,16 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         self._post_trigger_samples: int = 0
         self._sample_interval_ns: int = 0
 
+        # The PicoSDK rejects concurrent calls on a single handle
+        # (PICO_DRIVER_FUNCTION), so every section that touches the driver has
+        # to hold this lock — including readouts that block in a worker thread.
+        self._device_lock = asyncio.Lock()
+
+        # Incremented per StreamCaptures call. Only the newest stream may drive
+        # the device; older ones (e.g. a previous run whose stream was never
+        # closed) observe the change and exit without touching the scope.
+        self._stream_generation: int = 0
+
         self._capture_armed = asyncio.Event()
         self._capture_buffers: dict = {}
         # Number of waveforms armed for the current/last capture. 1 means a
@@ -117,6 +127,16 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         self._resolution: resolution_literal = "8bit"
 
     def _healthy(self) -> bool:
+        # Called from the SDK heartbeat loop on every manager ping. ping_unit()
+        # is itself a driver call, so issuing it while a capture is in flight
+        # trips PICO_DRIVER_FUNCTION and can leave the driver wedged. A held
+        # lock means the device is busy, which means it is alive.
+        #
+        # This is sync, so it cannot be preempted between the check and the
+        # call, and every driver call holds the lock — so if the lock is free,
+        # no driver call is in flight.
+        if self._device_lock.locked():
+            return True
         try:
             return self._scope.ping_unit()
         except Exception:
@@ -130,7 +150,8 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         ch = request.channel
 
         if not ch.enabled:
-            self._scope.set_channel(CHANNEL(ch.channel_index), enabled=False)
+            async with self._device_lock:
+                self._scope.set_channel(CHANNEL(ch.channel_index), enabled=False)
             logger.info("Channel %d disabled", ch.channel_index)
             return ConfigureChannelResponse()
 
@@ -146,13 +167,14 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
                 grpc.StatusCode.INVALID_ARGUMENT, f"Unsupported voltage range: {ch.voltage_range}"
             )
 
-        self._scope.set_channel(
-            channel=CHANNEL(ch.channel_index),
-            range=voltage_range,
-            enabled=True,
-            coupling=coupling,
-            offset=ch.analog_offset_volts,
-        )
+        async with self._device_lock:
+            self._scope.set_channel(
+                channel=CHANNEL(ch.channel_index),
+                range=voltage_range,
+                enabled=True,
+                coupling=coupling,
+                offset=ch.analog_offset_volts,
+            )
         logger.info(
             "Channel %d configured: range=%s, coupling=%s, offset=%.3g V",
             ch.channel_index,
@@ -166,7 +188,8 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         self, request: ConfigureTimebaseRequest, context: grpc.aio.ServicerContext
     ) -> ConfigureTimebaseResponse:
         total_samples = request.num_samples_pre_trigger + request.num_samples_post_trigger
-        info = self._scope.get_timebase(request.timebase_index, total_samples)
+        async with self._device_lock:
+            info = self._scope.get_timebase(request.timebase_index, total_samples)
 
         self._timebase_index = request.timebase_index
         self._pre_trigger_samples = request.num_samples_pre_trigger
@@ -205,9 +228,10 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         # Stop first: closing a unit mid-capture can fail, and close_unit()
         # discards the driver status, so the failure would pass unnoticed and
         # leave the handle stale.
-        self._scope.stop()
-        self._scope.close_unit()
-        self._scope.open_unit(resolution=resolution)
+        async with self._device_lock:
+            self._scope.stop()
+            self._scope.close_unit()
+            self._scope.open_unit(resolution=resolution)
         self._resolution = resolution
 
         # open_unit() turns all channels off and resets segmented memory, so
@@ -226,7 +250,8 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         trig = request.trigger
 
         if not trig.enabled:
-            self._scope.set_simple_trigger(CHANNEL(trig.channel_index), enable=False)
+            async with self._device_lock:
+                self._scope.set_simple_trigger(CHANNEL(trig.channel_index), enable=False)
             logger.info("Trigger disabled on channel %d", trig.channel_index)
             return ConfigureTriggerResponse()
 
@@ -237,15 +262,16 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
                 f"Unsupported trigger direction: {trig.direction}",
             )
 
-        self._scope.set_simple_trigger(
-            channel=CHANNEL(trig.channel_index),
-            threshold=trig.threshold_mv,
-            threshold_unit="mv",
-            enable=True,
-            direction=direction,
-            delay=trig.delay_samples,
-            auto_trigger=trig.auto_trigger_us,
-        )
+        async with self._device_lock:
+            self._scope.set_simple_trigger(
+                channel=CHANNEL(trig.channel_index),
+                threshold=trig.threshold_mv,
+                threshold_unit="mv",
+                enable=True,
+                direction=direction,
+                delay=trig.delay_samples,
+                auto_trigger=trig.auto_trigger_us,
+            )
         logger.info(
             "Trigger configured: ch=%d, dir=%s, threshold=%.1f mV, delay=%d, auto=%d us",
             trig.channel_index,
@@ -270,29 +296,32 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         # unset/0/1 all mean a normal, single-segment block capture.
         num_captures = request.num_captures if request.num_captures > 1 else 1
 
-        if num_captures > 1:
-            max_samples_per_segment = self._scope.memory_segments(num_captures)
-            if total_samples > max_samples_per_segment:
-                await context.abort(
-                    grpc.StatusCode.INVALID_ARGUMENT,
-                    f"{total_samples} samples per capture exceeds the "
-                    f"{max_samples_per_segment} samples available per segment "
-                    f"when using {num_captures} rapid block captures",
+        async with self._device_lock:
+            if num_captures > 1:
+                max_samples_per_segment = self._scope.memory_segments(num_captures)
+                if total_samples > max_samples_per_segment:
+                    await context.abort(
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        f"{total_samples} samples per capture exceeds the "
+                        f"{max_samples_per_segment} samples available per segment "
+                        f"when using {num_captures} rapid block captures",
+                    )
+                self._scope.set_no_of_captures(num_captures)
+                self._capture_buffers = self._scope.set_data_buffer_for_enabled_channels(
+                    total_samples, captures=num_captures
                 )
-            self._scope.set_no_of_captures(num_captures)
-            self._capture_buffers = self._scope.set_data_buffer_for_enabled_channels(
-                total_samples, captures=num_captures
-            )
-        else:
-            # Segment count persists on the device, so a normal capture armed
-            # after a rapid block run would otherwise only see 1/n of the
-            # memory in segment 0 and silently truncate.
-            self._scope.memory_segments(1)
-            self._scope.set_no_of_captures(1)
-            self._capture_buffers = self._scope.set_data_buffer_for_enabled_channels(total_samples)
+            else:
+                # Segment count persists on the device, so a normal capture armed
+                # after a rapid block run would otherwise only see 1/n of the
+                # memory in segment 0 and silently truncate.
+                self._scope.memory_segments(1)
+                self._scope.set_no_of_captures(1)
+                self._capture_buffers = self._scope.set_data_buffer_for_enabled_channels(
+                    total_samples
+                )
 
-        self._num_captures = num_captures
-        self._scope.run_block_capture(self._timebase_index, total_samples, pre_trig_pct)
+            self._num_captures = num_captures
+            self._scope.run_block_capture(self._timebase_index, total_samples, pre_trig_pct)
 
         self._capture_armed.set()
         logger.info(
@@ -314,78 +343,120 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
             for i in range(total_samples)
         ]
 
+        # Claim the device. Any stream opened earlier is now stale: a client
+        # that dies or is cancelled does not reliably close its stream, so
+        # without this the previous run's handler keeps looping and both drive
+        # the scope concurrently.
+        self._stream_generation += 1
+        my_generation = self._stream_generation
+        logger.info("StreamCaptures opened (generation %d)", my_generation)
+
         try:
             while True:
                 await self._capture_armed.wait()
+
+                # Checked before clearing, so that when a newer stream displaces
+                # this one both wake, this one exits, and the newer one still
+                # sees the armed flag.
+                if my_generation != self._stream_generation:
+                    logger.info(
+                        "StreamCaptures generation %d displaced by %d, exiting",
+                        my_generation,
+                        self._stream_generation,
+                    )
+                    return
+
                 self._capture_armed.clear()
 
-                num_captures = self._num_captures
+                # Read out under the lock, but yield outside it: holding the
+                # device while the client consumes would stall every other RPC
+                # for as long as the client is slow.
+                async with self._device_lock:
+                    if my_generation != self._stream_generation:
+                        return
+                    responses = await self._read_captures(total_samples, times)
 
-                if num_captures > 1:
-                    # Rapid block mode: one hardware readout for the whole
-                    # batch, then one response per captured segment.
-                    _actual_samples, overflow_lists = await asyncio.to_thread(
-                        self._scope.get_values_bulk, total_samples, 0, num_captures - 1
-                    )
-                    volts = self._scope.adc_to_volts(self._capture_buffers)
-                    offsets_ns = await asyncio.to_thread(
-                        lambda: [
-                            self._scope.get_trigger_time_offset(TIME_UNIT.NS, segment_index=i)
-                            for i in range(num_captures)
-                        ]
-                    )
-
-                    ts = Timestamp()
-                    ts.GetCurrentTime()
-
-                    for capture_index in range(num_captures):
-                        traces = [
-                            ChannelTrace(
-                                channel_index=ch_name.value,
-                                samples=samples[capture_index].tolist(),
-                                times_seconds=times,
-                                overflow=ch_name in overflow_lists[capture_index],
-                            )
-                            for ch_name, samples in volts.items()
-                        ]
-                        yield StreamCapturesResponse(
-                            traces=traces,
-                            trigger_timestamp=ts,
-                            capture_index=capture_index,
-                            num_captures=num_captures,
-                            trigger_time_offset_ns=offsets_ns[capture_index],
-                        )
-                else:
-                    await asyncio.to_thread(self._scope.get_values, total_samples)
-
-                    volts = self._scope.adc_to_volts(self._capture_buffers)
-                    overflowed = self._scope.is_over_range()
-
-                    traces = []
-                    for ch_name, samples in volts.items():
-                        traces.append(
-                            ChannelTrace(
-                                channel_index=ch_name.value,
-                                samples=samples.tolist(),
-                                times_seconds=times,
-                                overflow=ch_name in overflowed,
-                            )
-                        )
-
-                    ts = Timestamp()
-                    ts.GetCurrentTime()
-
-                    yield StreamCapturesResponse(
-                        traces=traces,
-                        trigger_timestamp=ts,
-                        capture_index=0,
-                        num_captures=1,
-                    )
+                for response in responses:
+                    yield response
         finally:
-            try:
-                self._scope.stop()
-            except Exception:
-                pass
+            # Only the current owner may stop the device — a displaced stream
+            # doing so would kill the capture the new stream just armed.
+            if my_generation == self._stream_generation:
+                async with self._device_lock:
+                    try:
+                        self._scope.stop()
+                    except Exception:
+                        logger.exception("stop() failed while closing StreamCaptures")
+            logger.info("StreamCaptures closed (generation %d)", my_generation)
+
+    async def _read_captures(
+        self, total_samples: int, times: list[float]
+    ) -> list[StreamCapturesResponse]:
+        """Read the armed capture(s) off the device. Caller must hold the lock."""
+        num_captures = self._num_captures
+
+        if num_captures > 1:
+            # Rapid block mode: one hardware readout for the whole batch, then
+            # one response per captured segment.
+            _actual_samples, overflow_lists = await asyncio.to_thread(
+                self._scope.get_values_bulk, total_samples, 0, num_captures - 1
+            )
+            volts = self._scope.adc_to_volts(self._capture_buffers)
+            offsets_ns = await asyncio.to_thread(
+                lambda: [
+                    self._scope.get_trigger_time_offset(TIME_UNIT.NS, segment_index=i)
+                    for i in range(num_captures)
+                ]
+            )
+
+            ts = Timestamp()
+            ts.GetCurrentTime()
+
+            return [
+                StreamCapturesResponse(
+                    traces=[
+                        ChannelTrace(
+                            channel_index=ch_name.value,
+                            samples=samples[capture_index].tolist(),
+                            times_seconds=times,
+                            overflow=ch_name in overflow_lists[capture_index],
+                        )
+                        for ch_name, samples in volts.items()
+                    ],
+                    trigger_timestamp=ts,
+                    capture_index=capture_index,
+                    num_captures=num_captures,
+                    trigger_time_offset_ns=offsets_ns[capture_index],
+                )
+                for capture_index in range(num_captures)
+            ]
+
+        await asyncio.to_thread(self._scope.get_values, total_samples)
+
+        volts = self._scope.adc_to_volts(self._capture_buffers)
+        overflowed = self._scope.is_over_range()
+
+        traces = [
+            ChannelTrace(
+                channel_index=ch_name.value,
+                samples=samples.tolist(),
+                times_seconds=times,
+                overflow=ch_name in overflowed,
+            )
+            for ch_name, samples in volts.items()
+        ]
+
+        ts = Timestamp()
+        ts.GetCurrentTime()
+
+        return [
+            StreamCapturesResponse(
+                traces=traces,
+                trigger_timestamp=ts,
+                capture_index=0,
+                num_captures=1,
+            )
+        ]
 
     # -- Query --
 
@@ -394,15 +465,16 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
     ) -> GetTimebasesResponse:
         sample_count = max(self._pre_trigger_samples + self._post_trigger_samples, 1000)
         timebases = []
-        for i in range(1000):
-            try:
-                info = self._scope.get_timebase(i, sample_count)
-                timebases.append(
-                    TimebaseInfo(
-                        timebase_index=i,
-                        sample_interval_ns=int(info["Interval(ns)"]),
+        async with self._device_lock:
+            for i in range(1000):
+                try:
+                    info = self._scope.get_timebase(i, sample_count)
+                    timebases.append(
+                        TimebaseInfo(
+                            timebase_index=i,
+                            sample_interval_ns=int(info["Interval(ns)"]),
+                        )
                     )
-                )
-            except Exception:
-                continue
+                except Exception:
+                    continue
         return GetTimebasesResponse(timebases=timebases)
