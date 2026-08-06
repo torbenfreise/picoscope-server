@@ -28,8 +28,10 @@ from h2pcontrol.picoscope.v1.picoscope_pb2 import (
     VOLTAGE_RANGE_100_MV,
     VOLTAGE_RANGE_200_MV,
     VOLTAGE_RANGE_500_MV,
-    ArmCaptureRequest,
-    ArmCaptureResponse,
+    Armed,
+    CaptureData,
+    CaptureRequest,
+    CaptureResponse,
     ChannelTrace,
     ConfigureChannelRequest,
     ConfigureChannelResponse,
@@ -43,8 +45,6 @@ from h2pcontrol.picoscope.v1.picoscope_pb2 import (
     GetTimebasesRequest,
     GetTimebasesResponse,
     Resolution,
-    StreamCapturesRequest,
-    StreamCapturesResponse,
     TimebaseInfo,
     TriggerDirection,
     VoltageRange,
@@ -56,9 +56,8 @@ from pypicosdk.constants import resolution_literal, trigger_dir_l
 
 logger = logging.getLogger(__name__)
 
-
 # Maps from protobuf enums to pypicosdk enums
-_VOLTAGE_RANGE_MAP: dict[VoltageRange, RANGE] = {
+_VOLTAGE_RANGE_MAP: dict[VoltageRange.ValueType, RANGE] = {
     VOLTAGE_RANGE_10_MV: RANGE.mV10,
     VOLTAGE_RANGE_20_MV: RANGE.mV20,
     VOLTAGE_RANGE_50_MV: RANGE.mV50,
@@ -72,12 +71,12 @@ _VOLTAGE_RANGE_MAP: dict[VoltageRange, RANGE] = {
     VOLTAGE_RANGE_20_V: RANGE.V20,
 }
 
-_COUPLING_MAP: dict[Coupling, COUPLING] = {
+_COUPLING_MAP: dict[Coupling.ValueType, COUPLING] = {
     COUPLING_DC: COUPLING.DC,
     COUPLING_AC: COUPLING.AC,
 }
 
-_TRIGGER_DIR_MAP: dict[TriggerDirection, trigger_dir_l] = {
+_TRIGGER_DIR_MAP: dict[TriggerDirection.ValueType, trigger_dir_l] = {
     TRIGGER_DIRECTION_RISING: "rising",
     TRIGGER_DIRECTION_FALLING: "falling",
     TRIGGER_DIRECTION_RISING_OR_FALLING: "rising or falling",
@@ -85,7 +84,7 @@ _TRIGGER_DIR_MAP: dict[TriggerDirection, trigger_dir_l] = {
     TRIGGER_DIRECTION_BELOW: "below",
 }
 
-_RESOLUTION_MAP: dict[Resolution, resolution_literal] = {
+_RESOLUTION_MAP: dict[Resolution.ValueType, resolution_literal] = {
     RESOLUTION_8_BIT: "8bit",
     RESOLUTION_12_BIT: "12bit",
     RESOLUTION_14_BIT: "14bit",
@@ -111,16 +110,12 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         # to hold this lock — including readouts that block in a worker thread.
         self._device_lock = asyncio.Lock()
 
-        # Incremented per StreamCaptures call. Only the newest stream may drive
-        # the device; older ones (e.g. a previous run whose stream was never
-        # closed) observe the change and exit without touching the scope.
-        self._stream_generation: int = 0
+        # True for the duration of a Capture call. The scope belongs to one
+        # acquisition at a time, so a second Capture is rejected rather than
+        # queued: a queued acquisition would arm at a moment the client cannot
+        # predict relative to its own trigger.
+        self._acquiring: bool = False
 
-        self._capture_armed = asyncio.Event()
-        self._capture_buffers: dict = {}
-        # Number of waveforms armed for the current/last capture. 1 means a
-        # normal single block capture; >1 means rapid block mode.
-        self._num_captures: int = 1
         # Current device resolution. open_unit() above takes the ps5000a
         # default of 8 bit. Tracked here rather than read back from
         # self._scope.resolution, which stores the mapped int, not the literal.
@@ -145,7 +140,7 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
     # -- Configuration --
 
     async def ConfigureChannel(
-        self, request: ConfigureChannelRequest, context: grpc.aio.ServicerContext
+            self, request: ConfigureChannelRequest, context: grpc.aio.ServicerContext
     ) -> ConfigureChannelResponse:
         ch = request.channel
 
@@ -185,7 +180,7 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         return ConfigureChannelResponse()
 
     async def ConfigureTimebase(
-        self, request: ConfigureTimebaseRequest, context: grpc.aio.ServicerContext
+            self, request: ConfigureTimebaseRequest, context: grpc.aio.ServicerContext
     ) -> ConfigureTimebaseResponse:
         total_samples = request.num_samples_pre_trigger + request.num_samples_post_trigger
         async with self._device_lock:
@@ -209,7 +204,7 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         )
 
     async def ConfigureResolution(
-        self, request: ConfigureResolutionRequest, context: grpc.aio.ServicerContext
+            self, request: ConfigureResolutionRequest, context: grpc.aio.ServicerContext
     ) -> ConfigureResolutionResponse:
         resolution = _RESOLUTION_MAP.get(request.resolution)
         if resolution is None:
@@ -234,18 +229,22 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
             self._scope.open_unit(resolution=resolution)
         self._resolution = resolution
 
-        # open_unit() turns all channels off and resets segmented memory, so
-        # any buffers and capture config from before the reopen are void.
-        # Channels and timebase must be reconfigured after this call.
-        self._capture_buffers = {}
-        self._num_captures = 1
-        self._capture_armed.clear()
+        # open_unit() turns all channels off, and the resolution changes which
+        # sample intervals the device can reach, so the stored timebase no
+        # longer describes the device. Drop it: Capture then fails with
+        # FAILED_PRECONDITION until the client reconfigures, rather than
+        # acquiring at an interval that differs from the one it was told.
+        self._timebase_index = None
+        self._sample_interval_ns = 0
 
-        logger.info("Resolution set to %s (device reopened)", resolution)
+        logger.info(
+            "Resolution set to %s (device reopened; channels and timebase must be reconfigured)",
+            resolution,
+        )
         return ConfigureResolutionResponse()
 
     async def ConfigureTrigger(
-        self, request: ConfigureTriggerRequest, context: grpc.aio.ServicerContext
+            self, request: ConfigureTriggerRequest, context: grpc.aio.ServicerContext
     ) -> ConfigureTriggerResponse:
         trig = request.trigger
 
@@ -265,7 +264,7 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
         async with self._device_lock:
             self._scope.set_simple_trigger(
                 channel=CHANNEL(trig.channel_index),
-                threshold=trig.threshold_mv,
+                threshold=round(trig.threshold_mv),
                 threshold_unit="mv",
                 enable=True,
                 direction=direction,
@@ -284,184 +283,164 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
 
     # -- Capture --
 
-    async def ArmCapture(
-        self, request: ArmCaptureRequest, context: grpc.aio.ServicerContext
-    ) -> ArmCaptureResponse:
+    async def Capture(  # type: ignore[override]
+            self, request: CaptureRequest, context: grpc.aio.ServicerContext
+    ) -> AsyncIterator[CaptureResponse]:
         if self._timebase_index is None:
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Timebase not configured")
 
-        total_samples = self._pre_trigger_samples + self._post_trigger_samples
-        pre_trig_pct = self._pre_trigger_samples / total_samples * 100 if total_samples > 0 else 0
+        # Rejected rather than queued: a queued acquisition would arm at a
+        # moment the client cannot predict relative to its own trigger.
+        if self._acquiring:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "An acquisition is already in progress"
+            )
 
         # unset/0/1 all mean a normal, single-segment block capture.
         num_captures = request.num_captures if request.num_captures > 1 else 1
-
-        async with self._device_lock:
-            if num_captures > 1:
-                max_samples_per_segment = self._scope.memory_segments(num_captures)
-                if total_samples > max_samples_per_segment:
-                    await context.abort(
-                        grpc.StatusCode.INVALID_ARGUMENT,
-                        f"{total_samples} samples per capture exceeds the "
-                        f"{max_samples_per_segment} samples available per segment "
-                        f"when using {num_captures} rapid block captures",
-                    )
-                self._scope.set_no_of_captures(num_captures)
-                self._capture_buffers = self._scope.set_data_buffer_for_enabled_channels(
-                    total_samples, captures=num_captures
-                )
-            else:
-                # Segment count persists on the device, so a normal capture armed
-                # after a rapid block run would otherwise only see 1/n of the
-                # memory in segment 0 and silently truncate.
-                self._scope.memory_segments(1)
-                self._scope.set_no_of_captures(1)
-                self._capture_buffers = self._scope.set_data_buffer_for_enabled_channels(
-                    total_samples
-                )
-
-            self._num_captures = num_captures
-            self._scope.run_block_capture(self._timebase_index, total_samples, pre_trig_pct)
-
-        self._capture_armed.set()
-        logger.info(
-            "Capture armed: timebase=%d, samples=%d (pre=%d, post=%d), captures=%d",
-            self._timebase_index,
-            total_samples,
-            self._pre_trigger_samples,
-            self._post_trigger_samples,
-            num_captures,
-        )
-        return ArmCaptureResponse()
-
-    async def StreamCaptures(  # type: ignore[override]
-        self, request: StreamCapturesRequest, context: grpc.aio.ServicerContext
-    ) -> AsyncIterator[StreamCapturesResponse]:
         total_samples = self._pre_trigger_samples + self._post_trigger_samples
-        times = [
-            (i - self._pre_trigger_samples) * self._sample_interval_ns * 1e-9
-            for i in range(total_samples)
-        ]
 
-        # Claim the device. Any stream opened earlier is now stale: a client
-        # that dies or is cancelled does not reliably close its stream, so
-        # without this the previous run's handler keeps looping and both drive
-        # the scope concurrently.
-        self._stream_generation += 1
-        my_generation = self._stream_generation
-        logger.info("StreamCaptures opened (generation %d)", my_generation)
-
+        self._acquiring = True
         try:
-            while True:
-                await self._capture_armed.wait()
+            async with self._device_lock:
+                buffers = await self._arm(num_captures, total_samples, context)
 
-                # Checked before clearing, so that when a newer stream displaces
-                # this one both wake, this one exits, and the newer one still
-                # sees the armed flag.
-                if my_generation != self._stream_generation:
-                    logger.info(
-                        "StreamCaptures generation %d displaced by %d, exiting",
-                        my_generation,
-                        self._stream_generation,
-                    )
-                    return
+            logger.info(
+                "Armed: timebase=%d, samples=%d (pre=%d, post=%d), captures=%d",
+                self._timebase_index,
+                total_samples,
+                self._pre_trigger_samples,
+                self._post_trigger_samples,
+                num_captures,
+            )
+            yield CaptureResponse(armed=Armed())
 
-                self._capture_armed.clear()
+            async with self._device_lock:
+                captures = await self._read(buffers, num_captures, total_samples)
 
-                # Read out under the lock, but yield outside it: holding the
-                # device while the client consumes would stall every other RPC
-                # for as long as the client is slow.
-                async with self._device_lock:
-                    if my_generation != self._stream_generation:
-                        return
-                    responses = await self._read_captures(total_samples, times)
-
-                for response in responses:
-                    yield response
+            for capture in captures:
+                yield CaptureResponse(capture=capture)
         finally:
-            # Only the current owner may stop the device — a displaced stream
-            # doing so would kill the capture the new stream just armed.
-            if my_generation == self._stream_generation:
-                async with self._device_lock:
-                    try:
-                        self._scope.stop()
-                    except Exception:
-                        logger.exception("stop() failed while closing StreamCaptures")
-            logger.info("StreamCaptures closed (generation %d)", my_generation)
+            self._acquiring = False
+            async with self._device_lock:
+                try:
+                    self._scope.stop()
+                except Exception:
+                    logger.exception("stop() failed while ending acquisition")
 
-    async def _read_captures(
-        self, total_samples: int, times: list[float]
-    ) -> list[StreamCapturesResponse]:
-        """Read the armed capture(s) off the device. Caller must hold the lock."""
-        num_captures = self._num_captures
+    async def _arm(
+            self, num_captures: int, total_samples: int, context: grpc.aio.ServicerContext
+    ) -> dict:
+        """Configure segments and buffers and start the block capture.
+
+        Caller must hold the device lock. Returns the per-channel buffers.
+        """
+        assert self._timebase_index is not None
+        pre_trig_pct = self._pre_trigger_samples / total_samples * 100 if total_samples > 0 else 0
+
+        # The interval a timebase index resolves to depends on the resolution
+        # and on how many channels are enabled, so enabling a channel after
+        # ConfigureTimebase can change it. The client builds its time axis from
+        # the interval reported at configuration time, so acquiring at a
+        # different one would mislabel every sample: refuse instead.
+        info = self._scope.get_timebase(self._timebase_index, total_samples)
+        interval_ns = int(info["Interval(ns)"])
+        if interval_ns != self._sample_interval_ns:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"Timebase {self._timebase_index} now resolves to {interval_ns} ns, "
+                f"not the {self._sample_interval_ns} ns reported when it was "
+                "configured — reconfigure the timebase after changing channels "
+                "or resolution",
+            )
 
         if num_captures > 1:
-            # Rapid block mode: one hardware readout for the whole batch, then
-            # one response per captured segment.
-            _actual_samples, overflow_lists = await asyncio.to_thread(
+            max_samples_per_segment = self._scope.memory_segments(num_captures)
+            if total_samples > max_samples_per_segment:
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"{total_samples} samples per capture exceeds the "
+                    f"{max_samples_per_segment} samples available per segment "
+                    f"when using {num_captures} rapid block captures",
+                )
+        else:
+            # Segment count persists on the device, so a normal capture taken
+            # after a rapid block acquisition would otherwise only see 1/n of
+            # the memory in segment 0 and silently truncate.
+            self._scope.memory_segments(1)
+
+        self._scope.set_no_of_captures(num_captures)
+        buffers = self._scope.set_data_buffer_for_enabled_channels(
+            total_samples, captures=num_captures if num_captures > 1 else 0
+        )
+        self._scope.run_block_capture(self._timebase_index, total_samples, pre_trig_pct)
+        return buffers
+
+    async def _read(
+            self, buffers: dict, num_captures: int, total_samples: int,
+    ) -> list[CaptureData]:
+        """Read the armed capture(s) off the device. Caller must hold the lock."""
+        if num_captures > 1:
+            # Rapid block: one readout for the whole batch, then one message
+            # per captured segment.
+            actual_samples, overflow_lists = await asyncio.to_thread(
                 self._scope.get_values_bulk, total_samples, 0, num_captures - 1
             )
-            volts = self._scope.adc_to_volts(self._capture_buffers)
+            # The driver may return fewer samples than asked for. The client
+            # derives its time axis from the sample count it requested, so a
+            # short read would shift every sample label without any visible
+            # symptom.
+            if actual_samples != total_samples:
+                logger.warning(
+                    "Short read: driver returned %d of %d samples per capture",
+                    actual_samples,
+                    total_samples,
+                )
             offsets_ns = await asyncio.to_thread(
                 lambda: [
                     self._scope.get_trigger_time_offset(TIME_UNIT.NS, segment_index=i)
                     for i in range(num_captures)
                 ]
             )
+        else:
+            await asyncio.to_thread(self._scope.get_values, total_samples)
+            overflow_lists = [self._scope.is_over_range()]
+            offsets_ns = [0]
 
-            ts = Timestamp()
-            ts.GetCurrentTime()
-
-            return [
-                StreamCapturesResponse(
-                    traces=[
-                        ChannelTrace(
-                            channel_index=ch_name.value,
-                            samples=samples[capture_index].tolist(),
-                            times_seconds=times,
-                            overflow=ch_name in overflow_lists[capture_index],
-                        )
-                        for ch_name, samples in volts.items()
-                    ],
-                    trigger_timestamp=ts,
-                    capture_index=capture_index,
-                    num_captures=num_captures,
-                    trigger_time_offset_ns=offsets_ns[capture_index],
-                )
-                for capture_index in range(num_captures)
-            ]
-
-        await asyncio.to_thread(self._scope.get_values, total_samples)
-
-        volts = self._scope.adc_to_volts(self._capture_buffers)
-        overflowed = self._scope.is_over_range()
-
-        traces = [
-            ChannelTrace(
-                channel_index=ch_name.value,
-                samples=samples.tolist(),
-                times_seconds=times,
-                overflow=ch_name in overflowed,
-            )
-            for ch_name, samples in volts.items()
-        ]
-
+        volts = self._scope.adc_to_volts(buffers)
+        # adc_to_volts is annotated dict | float | np.ndarray, but a dict buffer
+        # in always yields a dict out (keyed by CHANNEL enum members).
+        assert isinstance(volts, dict)
+        # Host clock at readout, shared by every capture in the batch: an
+        # approximate wall-clock label for the acquisition, not the instant a
+        # trigger fired. Device-accurate relative timing is in each capture's
+        # trigger_time_offset_ns.
         ts = Timestamp()
         ts.GetCurrentTime()
 
         return [
-            StreamCapturesResponse(
-                traces=traces,
+            CaptureData(
+                traces=[
+                    ChannelTrace(
+                        channel_index=ch_name.value,
+                        samples=(samples[i] if num_captures > 1 else samples).tolist(),
+                        # is_over_range() reports channel names ("A", "B"),
+                        # while volts is keyed by CHANNEL enum members.
+                        overflow=ch_name.name in overflow_lists[i],
+                    )
+                    for ch_name, samples in volts.items()
+                ],
                 trigger_timestamp=ts,
-                capture_index=0,
-                num_captures=1,
+                capture_index=i,
+                trigger_time_offset_ns=offsets_ns[i],
             )
+            for i in range(num_captures)
         ]
 
     # -- Query --
 
     async def GetTimebases(
-        self, request: GetTimebasesRequest, context: grpc.aio.ServicerContext
+            self, request: GetTimebasesRequest, context: grpc.aio.ServicerContext
     ) -> GetTimebasesResponse:
         sample_count = max(self._pre_trigger_samples + self._post_trigger_samples, 1000)
         timebases = []
