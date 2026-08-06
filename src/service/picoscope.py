@@ -51,7 +51,7 @@ from h2pcontrol.picoscope.v1.picoscope_pb2 import (
 )
 from h2pcontrol.picoscope.v1.picoscope_pb2_grpc import PicoscopeServiceServicer
 from h2pcontrol.sdk.server import Server
-from pypicosdk import CHANNEL, COUPLING, RANGE, ps5000a
+from pypicosdk import CHANNEL, COUPLING, RANGE, TIME_UNIT, ps5000a
 from pypicosdk.constants import resolution_literal, trigger_dir_l
 
 logger = logging.getLogger(__name__)
@@ -108,6 +108,9 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
 
         self._capture_armed = asyncio.Event()
         self._capture_buffers: dict = {}
+        # Number of waveforms armed for the current/last capture. 1 means a
+        # normal single block capture; >1 means rapid block mode.
+        self._num_captures: int = 1
 
     def _healthy(self) -> bool:
         try:
@@ -237,18 +240,38 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Timebase not configured")
 
         total_samples = self._pre_trigger_samples + self._post_trigger_samples
-        self._capture_buffers = self._scope.set_data_buffer_for_enabled_channels(total_samples)
-
         pre_trig_pct = self._pre_trigger_samples / total_samples * 100 if total_samples > 0 else 0
+
+        # unset/0/1 all mean a normal, single-segment block capture.
+        num_captures = request.num_captures if request.num_captures > 1 else 1
+
+        if num_captures > 1:
+            max_samples_per_segment = self._scope.memory_segments(num_captures)
+            if total_samples > max_samples_per_segment:
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"{total_samples} samples per capture exceeds the "
+                    f"{max_samples_per_segment} samples available per segment "
+                    f"when using {num_captures} rapid block captures",
+                )
+            self._scope.set_no_of_captures(num_captures)
+            self._capture_buffers = self._scope.set_data_buffer_for_enabled_channels(
+                total_samples, captures=num_captures
+            )
+        else:
+            self._capture_buffers = self._scope.set_data_buffer_for_enabled_channels(total_samples)
+
+        self._num_captures = num_captures
         self._scope.run_block_capture(self._timebase_index, total_samples, pre_trig_pct)
 
         self._capture_armed.set()
         logger.info(
-            "Capture armed: timebase=%d, samples=%d (pre=%d, post=%d)",
+            "Capture armed: timebase=%d, samples=%d (pre=%d, post=%d), captures=%d",
             self._timebase_index,
             total_samples,
             self._pre_trigger_samples,
             self._post_trigger_samples,
+            num_captures,
         )
         return ArmCaptureResponse()
 
@@ -266,26 +289,68 @@ class PicoscopeService(Server, PicoscopeServiceServicer):
                 await self._capture_armed.wait()
                 self._capture_armed.clear()
 
-                await asyncio.to_thread(self._scope.get_values, total_samples)
+                num_captures = self._num_captures
 
-                volts = self._scope.adc_to_volts(self._capture_buffers)
-                overflowed = self._scope.is_over_range()
-
-                traces = []
-                for ch_name, samples in volts.items():
-                    traces.append(
-                        ChannelTrace(
-                            channel_index=ch_name.value,
-                            samples=samples.tolist(),
-                            times_seconds=times,
-                            overflow=ch_name in overflowed,
-                        )
+                if num_captures > 1:
+                    # Rapid block mode: one hardware readout for the whole
+                    # batch, then one response per captured segment.
+                    _actual_samples, overflow_lists = await asyncio.to_thread(
+                        self._scope.get_values_bulk, total_samples, 0, num_captures - 1
+                    )
+                    volts = self._scope.adc_to_volts(self._capture_buffers)
+                    offsets_ns = await asyncio.to_thread(
+                        lambda: [
+                            self._scope.get_trigger_time_offset(TIME_UNIT.NS, segment_index=i)
+                            for i in range(num_captures)
+                        ]
                     )
 
-                ts = Timestamp()
-                ts.GetCurrentTime()
+                    ts = Timestamp()
+                    ts.GetCurrentTime()
 
-                yield StreamCapturesResponse(traces=traces, trigger_timestamp=ts)
+                    for capture_index in range(num_captures):
+                        traces = [
+                            ChannelTrace(
+                                channel_index=ch_name.value,
+                                samples=samples[capture_index].tolist(),
+                                times_seconds=times,
+                                overflow=ch_name in overflow_lists[capture_index],
+                            )
+                            for ch_name, samples in volts.items()
+                        ]
+                        yield StreamCapturesResponse(
+                            traces=traces,
+                            trigger_timestamp=ts,
+                            capture_index=capture_index,
+                            num_captures=num_captures,
+                            trigger_time_offset_ns=offsets_ns[capture_index],
+                        )
+                else:
+                    await asyncio.to_thread(self._scope.get_values, total_samples)
+
+                    volts = self._scope.adc_to_volts(self._capture_buffers)
+                    overflowed = self._scope.is_over_range()
+
+                    traces = []
+                    for ch_name, samples in volts.items():
+                        traces.append(
+                            ChannelTrace(
+                                channel_index=ch_name.value,
+                                samples=samples.tolist(),
+                                times_seconds=times,
+                                overflow=ch_name in overflowed,
+                            )
+                        )
+
+                    ts = Timestamp()
+                    ts.GetCurrentTime()
+
+                    yield StreamCapturesResponse(
+                        traces=traces,
+                        trigger_timestamp=ts,
+                        capture_index=0,
+                        num_captures=1,
+                    )
         finally:
             try:
                 self._scope.stop()
