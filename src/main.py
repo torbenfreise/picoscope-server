@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 async def main():
     cfg = ServerConfig.load()
     svc = PicoscopeService(cfg)
-    await svc.start()
+    try:
+        await svc.start()
+    finally:
+        svc.close()
 
 
 if __name__ == "__main__":
