@@ -29,7 +29,7 @@ select = ["E", "F", "I"]
 url = "https://buf.build/gen/python"
 
 [tool.uv.sources]
-h2pcontrol-sdk = { git = "https://github.com/torbenfreise/h2pcontrol-sdk", rev = "0.2.7" }
+h2pcontrol-sdk = { git = "https://github.com/torbenfreise/h2pcontrol-sdk", rev = "0.2.10" }
 
 [tool.uv]
 # The official protocolbuffers-pyi and mypy-protobuf stubs both ship the same
